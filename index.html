@@ -488,6 +488,75 @@
     }
 
     /* =========================================================
+       4.5 支付通知自动入账（快捷指令 → #fragment → 本地保存）
+       说明：参数放在 # 后面，不会随 HTTP 请求发给服务器。
+       用法：https://mf-ray.github.io/#auto=1&amount=28.50&raw=微信支付-美团-28.50元&type=expense
+       ========================================================= */
+
+    // 根据通知原文猜分类（关键词映射，猜错可在流水里删除重记）
+    function guessCategory(type, raw) {
+      if (type === 'income') {
+        return /工资|薪资|薪|报销|退款|入账|收入/.test(raw) ? '工资' : '其他';
+      }
+      const rules = [
+        [/美团|饿了么|外卖|餐|饭|咖啡|奶茶|星巴克|瑞幸|海底捞|肯德基|麦当劳|必胜客|食堂|面包|蛋糕|饮食|食品/, '餐饮'],
+        [/滴滴|打车|地铁|公交|高铁|火车|机票|飞机|加油|停车|单车|出行|交通|巴士|出租/, '交通'],
+        [/淘宝|京东|拼多多|购物|商城|商场|优衣库|服饰|鞋|数码|盒马|超市|网购/, '购物'],
+        [/房租|租金|物业|水费|电费|燃气|宽带|住房|租房|房贷/, '居住'],
+        [/电影|票房|游戏|KTV|视频|会员|音乐|娱乐|影院|演出|演唱会|爱奇艺|腾讯视频|网易云/, '娱乐']
+      ];
+      for (let i = 0; i < rules.length; i++) {
+        if (rules[i][0].test(raw)) return rules[i][1];
+      }
+      return '其他';
+    }
+
+    // 把通知原文压成简短备注
+    function extractNote(raw) {
+      if (!raw) return '支付通知自动记账';
+      return raw.replace(/^(微信支付|支付宝|支付成功|交易提醒)[：:\s-]*/, '').slice(0, 30);
+    }
+
+    // 解析 hash 并自动保存；保存后立即清掉 hash，防止刷新重复记账
+    function handleAutoEntry() {
+      const hash = location.hash || '';
+      if (!hash.startsWith('#auto=1')) return;
+
+      const params = new URLSearchParams(hash.slice(1));
+      let amount = parseFloat(params.get('amount'));
+      const raw = decodeURIComponentSafely(params.get('raw') || '');
+      const type = params.get('type') === 'income' ? 'income' : 'expense';
+
+      // 先清地址，再处理，避免 hashchange + load 双触发重复保存
+      history.replaceState(null, '', location.pathname + location.search);
+
+      if (!(amount > 0)) return toast('自动记账失败：未识别到金额');
+      amount = Math.round(amount * 100) / 100;
+
+      const record = {
+        id: (window.crypto && crypto.randomUUID)
+          ? crypto.randomUUID()
+          : Date.now() + '-' + Math.random().toString(36).slice(2),
+        type: type,
+        amount: amount,
+        category: guessCategory(type, raw),
+        note: extractNote(raw),
+        createdAt: Date.now()
+      };
+
+      addRecord(record).then(async () => {
+        await refreshViews();
+        toast('已自动记账：' + record.category + ' ¥' + amount.toFixed(2));
+      }).catch((err) => {
+        toast('自动记账失败：' + err.message);
+      });
+    }
+
+    function decodeURIComponentSafely(s) {
+      try { return decodeURIComponent(s); } catch (e) { return s; }
+    }
+
+    /* =========================================================
        5. 页面切换 / 删除确认
        ========================================================= */
     function showTab(name) {
@@ -638,6 +707,10 @@
         else if (e.key === 'Backspace') { e.preventDefault(); pressKey('del'); }
         else if (e.key === 'Enter') { e.preventDefault(); saveRecord(); }
       });
+
+      // 快捷指令从后台打开带 #auto=1 的链接时，页面可能已经加载过，
+      // 这里监听 hash 变化，确保冷启动和热唤醒都能自动入账
+      window.addEventListener('hashchange', handleAutoEntry);
     }
 
     /* =========================================================
@@ -657,6 +730,9 @@
         toast('本地存储不可用：' + err.message);
       }
       await refreshViews();
+
+      // 冷启动时若链接带 #auto=1，自动入账
+      handleAutoEntry();
     }
 
     init();
