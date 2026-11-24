@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <!-- viewport-fit=cover 让内容延伸到刘海/灵动岛区域；user-scalable=no 防止误缩放，更像原生 App -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
+  <meta name="format-detection" content="telephone=no">
+  <title>极简记账</title>
+
+  <!-- ==================== PWA / iOS 添加到主屏幕配置 ==================== -->
+  <meta name="apple-mobile-web-app-capable" content="yes">          <!-- 全屏 standalone，无 Safari 地址栏 -->
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="极简记账">
+  <meta name="theme-color" content="#f8fafc">
+
+  <!-- Tailwind CSS（唯一外部依赖，仅样式，不是框架逻辑） -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['-apple-system', 'BlinkMacSystemFont', '"PingFang SC"', '"Helvetica Neue"', 'Arial', 'sans-serif']
+          }
+        }
+      }
+    };
+  </script>
+
+  <style>
+    /* 小屏高度兜底：旧版 Safari 用 vh，新版用 dvh（地址栏收起时不跳动） */
+    .app-shell { height: 100vh; height: 100dvh; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      -webkit-tap-highlight-color: transparent;
+      overscroll-behavior-y: none;
+      background: #e2e8f0;
+    }
+    /* 安全区适配：底部 Home Indicator 不会被导航条遮挡 */
+    .safe-top    { padding-top: env(safe-area-inset-top, 0px); }
+    .safe-bottom { padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 2px); }
+    .no-scrollbar::-webkit-scrollbar { display: none; }
+    /* iOS 输入框聚焦时，字号 >=16px 才不会自动放大页面 */
+    input { font-size: 16px; }
+    button { touch-action: manipulation; }
+    .press:active { transform: scale(.97); opacity: .78; }
+    .press { transition: transform .1s ease, opacity .1s ease; }
+  </style>
+</head>
+
+<body class="font-sans text-slate-900 antialiased">
+  <div class="app-shell mx-auto flex max-w-md flex-col overflow-hidden bg-slate-50 shadow-xl">
+
+    <!-- ==================== 顶部栏 ==================== -->
+    <header class="safe-top flex items-center justify-between border-b border-slate-200 bg-white px-5 py-3">
+      <h1 class="text-lg font-semibold tracking-tight">极简记账</h1>
+      <button id="exportBtn" type="button"
+        class="press rounded-full border border-slate-200 bg-slate-50 px-3.5 py-1.5 text-xs font-medium text-slate-600">
+        导出 CSV
+      </button>
+    </header>
+
+    <!-- ==================== 三个页面（默认显示记账录入页） ==================== -->
+    <main id="scroller" class="no-scrollbar relative flex-1 overflow-y-auto">
+
+      <!-- ---------- 页面 1：记账录入 ---------- -->
+      <section id="view-entry" class="px-5 pb-8 pt-4">
+        <!-- 收入 / 支出 切换，默认支出 -->
+        <div class="mx-auto flex w-64 rounded-2xl bg-slate-200/70 p-1">
+          <button type="button" data-type="expense" class="type-btn press flex-1 rounded-xl py-2 text-sm font-medium">支出</button>
+          <button type="button" data-type="income"  class="type-btn press flex-1 rounded-xl py-2 text-sm font-medium">收入</button>
+        </div>
+
+        <!-- 金额显示区（大字号，单手易读） -->
+        <div class="mt-7 text-center">
+          <div class="text-xs text-slate-400">金额（元）</div>
+          <div class="mt-1 flex items-end justify-center gap-1.5">
+            <span class="mb-2 text-2xl font-normal text-slate-400">¥</span>
+            <span id="amountDisplay" class="text-5xl font-semibold tabular-nums tracking-tight text-slate-900">0</span>
+          </div>
+        </div>
+
+        <!-- 分类标签：点选，无需输入 -->
+        <div class="mt-6">
+          <div class="mb-2 text-xs font-medium text-slate-400">分类</div>
+          <div id="categoryList" class="flex flex-wrap gap-2"></div>
+        </div>
+
+        <!-- 备注（选填） + 自动时间说明 -->
+        <div class="mt-5">
+          <label for="noteInput" class="mb-2 block text-xs font-medium text-slate-400">备注（选填）</label>
+          <input id="noteInput" type="text" maxlength="40" enterkeyhint="done" placeholder="写点什么…"
+            class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-base outline-none transition-colors focus:border-indigo-400">
+          <p class="mt-2 text-[11px] text-slate-400">时间：自动记录当前时刻，无需手动修改</p>
+        </div>
+
+        <!-- 保存按钮 -->
+        <button id="saveBtn" type="button"
+          class="press mt-5 w-full rounded-2xl bg-indigo-600 py-3.5 text-base font-semibold text-white shadow-sm shadow-indigo-200">
+          保存记录
+        </button>
+
+        <!-- 自定义数字键盘：大按钮，适配拇指操作 -->
+        <div id="keypad" class="mt-5 grid grid-cols-3 gap-2"></div>
+
+        <p class="mt-5 text-center text-[11px] leading-5 text-slate-400">
+          所有数据仅保存在本机浏览器<br>不会上传服务器
+        </p>
+      </section>
+
+      <!-- ---------- 页面 2：流水列表 ---------- -->
+      <section id="view-list" class="hidden px-5 pb-8 pt-4">
+        <div class="mb-4 flex items-center justify-between">
+          <h2 class="text-base font-semibold">流水明细</h2>
+          <span id="listCount" class="text-xs text-slate-400">共 0 笔</span>
+        </div>
+        <div id="recordList" class="space-y-2"></div>
+        <div id="emptyList" class="mt-24 hidden text-center text-sm leading-6 text-slate-400">
+          还没有记录<br>去记一笔吧
+        </div>
+      </section>
+
+      <!-- ---------- 页面 3：简单统计 ---------- -->
+      <section id="view-stats" class="hidden px-5 pb-8 pt-4">
+        <h2 class="text-base font-semibold"><span id="statMonth">本月</span>统计</h2>
+
+        <div class="mt-4 grid grid-cols-2 gap-3">
+          <div class="rounded-2xl border border-slate-100 bg-white p-4 shadow-sm">
+            <div class="text-xs text-slate-400">本月总收入</div>
+            <div id="statIncome" class="mt-2 text-2xl font-semibold tabular-nums text-emerald-600">¥0.00</div>
+          </div>
+          <div class="rounded-2xl border border-slate-100 bg-white p-4 shadow-sm">
+            <div class="text-xs text-slate-400">本月总支出</div>
+            <div id="statExpense" class="mt-2 text-2xl font-semibold tabular-nums text-rose-600">¥0.00</div>
+          </div>
+        </div>
+
+        <div class="mt-3 rounded-2xl bg-indigo-600 p-4 text-white shadow-sm shadow-indigo-200">
+          <div class="text-xs text-indigo-100">本月结余</div>
+          <div id="statBalance" class="mt-1 text-3xl font-semibold tabular-nums">¥0.00</div>
+        </div>
+
+        <div class="mt-8 rounded-2xl border border-dashed border-slate-200 p-4 text-center text-xs leading-6 text-slate-400">
+          统计范围：当前自然月<br>数据只在本机，不联网、不同步
+        </div>
+      </section>
+    </main>
+
+    <!-- ==================== 底部导航（三个页面） ==================== -->
+    <nav class="safe-bottom grid grid-cols-3 border-t border-slate-200 bg-white">
+      <button type="button" data-tab="entry" class="tab press flex flex-col items-center gap-0.5 py-2 text-[11px]">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" class="h-5 w-5"><path d="M12 5v14M5 12h14"/></svg>
+        <span>记账</span>
+      </button>
+      <button type="button" data-tab="list" class="tab press flex flex-col items-center gap-0.5 py-2 text-[11px]">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" class="h-5 w-5"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+        <span>流水</span>
+      </button>
+      <button type="button" data-tab="stats" class="tab press flex flex-col items-center gap-0.5 py-2 text-[11px]">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" class="h-5 w-5"><path d="M3 20h18M7 20v-6M12 20V8M17 20v-10"/></svg>
+        <span>统计</span>
+      </button>
+    </nav>
+  </div>
+
+  <!-- ==================== 轻提示 ==================== -->
+  <div id="toast" class="pointer-events-none fixed bottom-24 left-1/2 z-[60] -translate-x-1/2 rounded-full bg-slate-900/90 px-5 py-2.5 text-sm text-white opacity-0 transition-opacity duration-200"></div>
+
+  <!-- ==================== 删除确认弹层 ==================== -->
+  <div id="confirmLayer" class="fixed inset-0 z-50 hidden items-end justify-center bg-slate-900/30 p-4">
+    <div class="w-full max-w-md rounded-3xl bg-white p-5 shadow-xl">
+      <div id="confirmTitle" class="text-base font-semibold"></div>
+      <div id="confirmDesc" class="mt-1 text-sm text-slate-400"></div>
+      <div class="mt-5 flex gap-3">
+        <button id="confirmCancel" type="button" class="press flex-1 rounded-2xl bg-slate-100 py-3 text-sm font-medium text-slate-600">取消</button>
+        <button id="confirmOk" type="button" class="press flex-1 rounded-2xl bg-rose-600 py-3 text-sm font-medium text-white">删除</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  (function () {
+    'use strict';
+
+    /* =========================================================
+       0. 基础配置与工具函数
+       ========================================================= */
+    const $ = (sel) => document.querySelector(sel);
+
+    // 分类表：支出 6 类、收入 2 类（点选，不需要输入）
+    const CATEGORIES = {
+      expense: ['餐饮', '交通', '购物', '居住', '娱乐', '其他'],
+      income:  ['工资', '其他']
+    };
+
+    const state = {
+      type: 'expense',                 // 当前收支类型，默认支出
+      category: CATEGORIES.expense[0], // 当前分类
+      amountRaw: '',                   // 金额原始字符串（支持小数点）
+      records: [],                     // 全部记录（按时间倒序）
+      pendingAction: null              // 确认弹层的回调
+    };
+
+    let db = null;                     // IndexedDB 实例
+
+    const pad = (n) => String(n).padStart(2, '0');
+    const escapeHtml = (s) => String(s || '').replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+
+    // 轻提示
+    let toastTimer = null;
+    function toast(msg) {
+      const el = $('#toast');
+      el.textContent = msg;
+      el.style.opacity = '1';
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => { el.style.opacity = '0'; }, 1800);
+    }
+
+    /* =========================================================
+       1. IndexedDB：纯本地存储，无后端、无上传
+       ========================================================= */
+    const DB_NAME = 'minimal-ledger';
+    const STORE = 'records';
+
+    function openDB() {
+      return new Promise((resolve, reject) => {
+        if (!('indexedDB' in window)) return reject(new Error('此浏览器不支持 IndexedDB'));
+        const req = indexedDB.open(DB_NAME, 1);
+        req.onupgradeneeded = () => {
+          const database = req.result;
+          if (!database.objectStoreNames.contains(STORE)) {
+            const store = database.createObjectStore(STORE, { keyPath: 'id' });
+            store.createIndex('createdAt', 'createdAt'); // 便于按时间排序
+          }
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    function getAllRecords() {
+      return new Promise((resolve, reject) => {
+        if (!db) return reject(new Error('本地数据库不可用'));
+        const req = db.transaction(STORE, 'readonly').objectStore(STORE).getAll();
+        req.onsuccess = () => resolve(req.result.sort((a, b) => b.createdAt - a.createdAt));
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    function addRecord(record) {
+      return new Promise((resolve, reject) => {
+        if (!db) return reject(new Error('本地数据库不可用'));
+        const req = db.transaction(STORE, 'readwrite').objectStore(STORE).add(record);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    function deleteRecord(id) {
+      return new Promise((resolve, reject) => {
+        if (!db) return reject(new Error('本地数据库不可用'));
+        const req = db.transaction(STORE, 'readwrite').objectStore(STORE).delete(id);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    /* =========================================================
+       2. 录入页：类型切换 / 键盘 / 分类 / 金额
+       ========================================================= */
+
+    // 生成自定义数字键盘（1-9 / . / 0 / 退格）
+    function buildKeypad() {
+      const keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '.', '0', 'del'];
+      $('#keypad').innerHTML = keys.map((k) => {
+        const label = k === 'del' ? '⌫' : k;
+        const cls = (k === '.' || k === 'del')
+          ? 'bg-slate-100 text-slate-600'
+          : 'bg-white text-slate-900';
+        return '<button type="button" data-key="' + k + '" class="press flex h-14 items-center justify-center rounded-2xl border border-slate-200 ' + cls + ' text-2xl font-medium shadow-sm">' + label + '</button>';
+      }).join('');
+    }
+
+    // 切换支出 / 收入：分类同步重置为该类型第一项
+    function setType(type) {
+      state.type = type;
+      state.category = CATEGORIES[type][0];
+      document.querySelectorAll('.type-btn').forEach((btn) => {
+        const active = btn.dataset.type === type;
+        btn.className = 'type-btn press flex-1 rounded-xl py-2 text-sm font-medium ' +
+          (active ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500');
+      });
+      renderCategories();
+    }
+
+    // 渲染分类标签
+    function renderCategories() {
+      $('#categoryList').innerHTML = CATEGORIES[state.type].map((cat) => {
+        const active = cat === state.category;
+        return '<button type="button" data-cat="' + cat + '" class="press rounded-full border px-4 py-2 text-sm font-medium ' +
+          (active ? 'border-indigo-600 bg-indigo-600 text-white' : 'border-slate-200 bg-white text-slate-600') +
+          '">' + cat + '</button>';
+      }).join('');
+    }
+
+    // 千分位格式化（仅显示用，存储仍是纯数字）
+    function formatRaw(raw) {
+      if (!raw) return '';
+      const parts = raw.split('.');
+      const intPart = (parts[0] || '0').replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+      return parts.length === 2 ? intPart + '.' + parts[1] : intPart;
+    }
+
+    function renderAmount() {
+      $('#amountDisplay').textContent = formatRaw(state.amountRaw) || '0';
+    }
+
+    // 键盘输入逻辑：限制整数 8 位、小数 2 位
+    function pressKey(key) {
+      if (key === 'del') {
+        state.amountRaw = state.amountRaw.slice(0, -1);
+      } else if (key === '.') {
+        if (!state.amountRaw.includes('.')) {
+          state.amountRaw = (state.amountRaw || '0') + '.';
+        }
+      } else {
+        const parts = state.amountRaw.split('.');
+        if (parts.length === 2 && parts[1].length >= 2) return toast('最多两位小数');
+        if (parts.length === 1 && parts[0].length >= 8) return toast('金额过大');
+        state.amountRaw = (state.amountRaw === '0' ? '' : state.amountRaw) + key;
+      }
+      renderAmount();
+    }
+
+    // 保存一笔：时间取当前时刻，不提供手动修改
+    async function saveRecord() {
+      const amount = Number(state.amountRaw);
+      if (!state.amountRaw || !(amount > 0)) return toast('请输入金额');
+
+      const record = {
+        id: (window.crypto && crypto.randomUUID)
+          ? crypto.randomUUID()
+          : Date.now() + '-' + Math.random().toString(36).slice(2),
+        type: state.type,
+        amount: Math.round(amount * 100) / 100,
+        category: state.category,
+        note: $('#noteInput').value.trim(),
+        createdAt: Date.now()          // 当前时间戳
+      };
+
+      try {
+        await addRecord(record);
+        state.amountRaw = '';
+        $('#noteInput').value = '';
+        renderAmount();
+        toast('已保存');
+        await refreshViews();
+        // 停留在录入页，方便连续记账
+      } catch (err) {
+        toast('保存失败：' + err.message);
+      }
+    }
+
+    /* =========================================================
+       3. 流水列表 / 统计 渲染
+       ========================================================= */
+
+    async function refreshViews() {
+      try {
+        state.records = await getAllRecords();
+      } catch (err) {
+        state.records = [];
+        toast('读取本地数据失败');
+      }
+      renderList(state.records);
+      renderStats(state.records);
+    }
+
+    const fmtDateHeader = (d) =>
+      (d.getFullYear() === new Date().getFullYear()
+        ? (d.getMonth() + 1) + '月' + d.getDate() + '日'
+        : d.getFullYear() + '年' + (d.getMonth() + 1) + '月' + d.getDate() + '日') +
+      ' 周' + '日一二三四五六'[d.getDay()];
+
+    function renderList(records) {
+      const el = $('#recordList');
+      $('#listCount').textContent = '共 ' + records.length + ' 笔';
+      $('#emptyList').classList.toggle('hidden', records.length > 0);
+
+      if (!records.length) { el.innerHTML = ''; return; }
+
+      let html = '';
+      let lastDay = '';
+      records.forEach((r) => {
+        const d = new Date(r.createdAt);
+        const dayKey = d.getFullYear() + '-' + d.getMonth() + '-' + d.getDate();
+        if (dayKey !== lastDay) {
+          html += '<div class="px-1 pb-1 pt-3 text-xs font-medium text-slate-400">' + fmtDateHeader(d) + '</div>';
+          lastDay = dayKey;
+        }
+
+        const isIncome = r.type === 'income';
+        const sign = isIncome ? '+' : '−';
+        const amountColor = isIncome ? 'text-emerald-600' : 'text-slate-800';
+        const badgeColor = isIncome
+          ? 'bg-emerald-50 text-emerald-600'
+          : 'bg-indigo-50 text-indigo-600';
+        const time = pad(d.getHours()) + ':' + pad(d.getMinutes());
+        const note = r.note ? ' · ' + escapeHtml(r.note) : '';
+
+        html +=
+          '<div class="flex items-center gap-3 rounded-2xl border border-slate-100 bg-white p-3.5 shadow-sm">' +
+            '<div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-xs font-medium ' + badgeColor + '">' + escapeHtml(r.category) + '</div>' +
+            '<div class="min-w-0 flex-1">' +
+              '<div class="truncate text-sm font-medium">' + escapeHtml(r.category) + '</div>' +
+              '<div class="mt-0.5 truncate text-xs text-slate-400">' + time + note + '</div>' +
+            '</div>' +
+            '<div class="shrink-0 text-right">' +
+              '<div class="text-sm font-semibold tabular-nums ' + amountColor + '">' + sign + '¥' + r.amount.toFixed(2) + '</div>' +
+              '<button type="button" data-del="' + r.id + '" class="press mt-1 text-[11px] text-slate-400">删除</button>' +
+            '</div>' +
+          '</div>';
+      });
+      el.innerHTML = html;
+    }
+
+    function renderStats(records) {
+      const now = new Date();
+      const year = now.getFullYear();
+      const month = now.getMonth();
+      $('#statMonth').textContent = year + '年' + (month + 1) + '月';
+
+      let income = 0;
+      let expense = 0;
+      records.forEach((r) => {
+        const d = new Date(r.createdAt);
+        if (d.getFullYear() !== year || d.getMonth() !== month) return;
+        if (r.type === 'income') income += r.amount;
+        else expense += r.amount;
+      });
+
+      income = Math.round(income * 100) / 100;
+      expense = Math.round(expense * 100) / 100;
+      const balance = Math.round((income - expense) * 100) / 100;
+
+      $('#statIncome').textContent = '¥' + income.toFixed(2);
+      $('#statExpense').textContent = '¥' + expense.toFixed(2);
+      $('#statBalance').textContent = (balance < 0 ? '−¥' : '¥') + Math.abs(balance).toFixed(2);
+    }
+
+    /* =========================================================
+       4. 导出 CSV（全部记录，带 BOM，Excel 打开中文不乱码）
+       ========================================================= */
+    function exportCSV() {
+      if (!state.records.length) return toast('暂无记录可导出');
+
+      const rows = [['时间', '类型', '金额', '分类', '备注']];
+      state.records.forEach((r) => {
+        const d = new Date(r.createdAt);
+        const ts = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' +
+                   pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+        rows.push([
+          ts,
+          r.type === 'income' ? '收入' : '支出',
+          (r.type === 'income' ? '' : '-') + r.amount.toFixed(2),
+          r.category,
+          r.note || ''
+        ]);
+      });
+
+      // 双引号转义，避免备注里的逗号/换行破坏 CSV
+      const csv = '\uFEFF' + rows.map((row) =>
+        row.map((cell) => '"' + String(cell).replace(/"/g, '""') + '"').join(',')
+      ).join('\r\n');
+
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = '极简记账-' + new Date().getFullYear() + pad(new Date().getMonth() + 1) + pad(new Date().getDate()) + '.csv';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast('已导出全部记录');
+    }
+
+    /* =========================================================
+       5. 页面切换 / 删除确认
+       ========================================================= */
+    function showTab(name) {
+      ['entry', 'list', 'stats'].forEach((n) => {
+        $('#view-' + n).classList.toggle('hidden', n !== name);
+      });
+      document.querySelectorAll('.tab').forEach((btn) => {
+        const active = btn.dataset.tab === name;
+        btn.className = 'tab press flex flex-col items-center gap-0.5 py-2 text-[11px] ' +
+          (active ? 'text-indigo-600' : 'text-slate-400');
+      });
+      $('#scroller').scrollTop = 0;
+      if (name === 'list' || name === 'stats') refreshViews();
+    }
+
+    function showConfirm(title, desc, action) {
+      state.pendingAction = action;
+      $('#confirmTitle').textContent = title;
+      $('#confirmDesc').textContent = desc;
+      $('#confirmLayer').style.display = 'flex';
+    }
+    function hideConfirm() {
+      $('#confirmLayer').style.display = 'none';
+      state.pendingAction = null;
+    }
+
+    /* =========================================================
+       6. PWA 图标与 manifest（运行时生成，保持只有一个文件）
+       说明：Service Worker 必须是独立同源 JS 文件，单文件方案无法注册，
+            因此不做离线缓存；iOS 全屏由 apple-mobile-web-app-capable 实现。
+       ========================================================= */
+    function initPWA() {
+      const canvas = document.createElement('canvas');
+      canvas.width = canvas.height = 180;
+      const ctx = canvas.getContext('2d');
+      // 圆角底色
+      ctx.fillStyle = '#4f46e5';
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(0, 0, 180, 180, 40);
+      else {
+        ctx.moveTo(40, 0); ctx.lineTo(140, 0); ctx.quadraticCurveTo(180, 0, 180, 40);
+        ctx.lineTo(180, 140); ctx.quadraticCurveTo(180, 180, 140, 180);
+        ctx.lineTo(40, 180); ctx.quadraticCurveTo(0, 180, 0, 140);
+        ctx.lineTo(0, 40); ctx.quadraticCurveTo(0, 0, 40, 0);
+      }
+      ctx.fill();
+      // 白色 ¥ 符号
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '600 96px -apple-system, "PingFang SC", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('¥', 90, 94);
+      const icon = canvas.toDataURL('image/png');
+
+      // apple-touch-icon：添加到主屏幕时的图标
+      const iconLink = document.createElement('link');
+      iconLink.rel = 'apple-touch-icon';
+      iconLink.href = icon;
+      document.head.appendChild(iconLink);
+
+      // web app manifest（Android/Chrome 使用；iOS 主要读上面的 meta 标签）
+      const manifest = {
+        name: '极简记账',
+        short_name: '极简记账',
+        start_url: '.',
+        scope: '.',
+        display: 'standalone',
+        orientation: 'portrait',
+        background_color: '#f8fafc',
+        theme_color: '#4f46e5',
+        icons: [{ src: icon, sizes: '180x180', type: 'image/png', purpose: 'any maskable' }]
+      };
+      const manifestLink = document.createElement('link');
+      manifestLink.rel = 'manifest';
+      manifestLink.href = URL.createObjectURL(new Blob(
+        [JSON.stringify(manifest)], { type: 'application/manifest+json' }
+      ));
+      document.head.appendChild(manifestLink);
+    }
+
+    /* =========================================================
+       7. 事件绑定
+       ========================================================= */
+    function bindEvents() {
+      // 数字键盘
+      $('#keypad').addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-key]');
+        if (btn) pressKey(btn.dataset.key);
+      });
+
+      // 收支切换
+      document.querySelectorAll('.type-btn').forEach((btn) => {
+        btn.addEventListener('click', () => setType(btn.dataset.type));
+      });
+
+      // 分类点选
+      $('#categoryList').addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-cat]');
+        if (!btn) return;
+        state.category = btn.dataset.cat;
+        renderCategories();
+      });
+
+      $('#saveBtn').addEventListener('click', saveRecord);
+      $('#exportBtn').addEventListener('click', exportCSV);
+
+      // 底部导航
+      document.querySelectorAll('.tab').forEach((btn) => {
+        btn.addEventListener('click', () => showTab(btn.dataset.tab));
+      });
+
+      // 删除（事件委托）
+      $('#recordList').addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-del]');
+        if (!btn) return;
+        showConfirm('删除这条记录？', '删除后无法恢复', async () => {
+          try {
+            await deleteRecord(btn.dataset.del);
+            toast('已删除');
+            await refreshViews();
+          } catch (err) {
+            toast('删除失败：' + err.message);
+          }
+        });
+      });
+
+      $('#confirmCancel').addEventListener('click', hideConfirm);
+      $('#confirmLayer').addEventListener('click', (e) => {
+        if (e.target === $('#confirmLayer')) hideConfirm();
+      });
+      $('#confirmOk').addEventListener('click', () => {
+        const fn = state.pendingAction;
+        hideConfirm();
+        if (fn) fn();
+      });
+
+      // 备注输入时，Done 键收起键盘
+      $('#noteInput').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); }
+      });
+
+      // 物理键盘也能输金额（录入页且备注未聚焦时）
+      document.addEventListener('keydown', (e) => {
+        if ($('#view-entry').classList.contains('hidden')) return;
+        if (document.activeElement === $('#noteInput')) return;
+        if (/^[0-9]$/.test(e.key)) { e.preventDefault(); pressKey(e.key); }
+        else if (e.key === '.') { e.preventDefault(); pressKey('.'); }
+        else if (e.key === 'Backspace') { e.preventDefault(); pressKey('del'); }
+        else if (e.key === 'Enter') { e.preventDefault(); saveRecord(); }
+      });
+    }
+
+    /* =========================================================
+       8. 启动
+       ========================================================= */
+    async function init() {
+      buildKeypad();
+      setType('expense');      // 默认支出
+      renderAmount();
+      bindEvents();
+      initPWA();
+      showTab('entry');        // 打开页面默认记账录入页
+
+      try {
+        db = await openDB();
+      } catch (err) {
+        toast('本地存储不可用：' + err.message);
+      }
+      await refreshViews();
+    }
+
+    init();
+  })();
+  </script>
+</body>
+</html>
