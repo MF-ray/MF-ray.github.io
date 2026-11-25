@@ -240,31 +240,63 @@
       });
     }
 
-    function getAllRecords() {
+    // iOS Safari 会把后台页面的 IndexedDB 连接自动关闭，快捷指令唤醒后
+    // 旧的 db 引用已经失效，直接 transaction 会抛 "connection is closing"。
+    // 这里统一走事务执行器：遇到连接失效就重开一次，再自动重试该操作。
+    function isConnError(err) {
+      return /closing|closed|InvalidState|not active|connection/i.test(
+        String((err && err.message) || err || '')
+      );
+    }
+
+    function reopenDB() {
+      try { if (db) db.close(); } catch (e) {}
+      db = null;
+      return openDB().then((fresh) => { db = fresh; return fresh; });
+    }
+
+    function runTx(mode, fn, retried) {
       return new Promise((resolve, reject) => {
-        if (!db) return reject(new Error('本地数据库不可用'));
-        const req = db.transaction(STORE, 'readonly').objectStore(STORE).getAll();
-        req.onsuccess = () => resolve(req.result.sort((a, b) => b.createdAt - a.createdAt));
-        req.onerror = () => reject(req.error);
+        // 连接还没打开（冷启动时 hashchange 可能抢在 init 之前触发）
+        if (!db) {
+          openDB().then((fresh) => { db = fresh; return runTx(mode, fn, retried); })
+                  .then(resolve, reject);
+          return;
+        }
+        let req;
+        try {
+          req = fn(db.transaction(STORE, mode).objectStore(STORE));
+        } catch (err) {
+          if (!retried && isConnError(err)) {
+            reopenDB().then(() => runTx(mode, fn, true)).then(resolve, reject);
+          } else {
+            reject(err);
+          }
+          return;
+        }
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => {
+          const err = req.error;
+          if (!retried && isConnError(err)) {
+            reopenDB().then(() => runTx(mode, fn, true)).then(resolve, reject);
+          } else {
+            reject(err || new Error('数据库操作失败'));
+          }
+        };
       });
+    }
+
+    function getAllRecords() {
+      return runTx('readonly', (store) => store.getAll())
+        .then((rows) => rows.sort((a, b) => b.createdAt - a.createdAt));
     }
 
     function addRecord(record) {
-      return new Promise((resolve, reject) => {
-        if (!db) return reject(new Error('本地数据库不可用'));
-        const req = db.transaction(STORE, 'readwrite').objectStore(STORE).add(record);
-        req.onsuccess = () => resolve();
-        req.onerror = () => reject(req.error);
-      });
+      return runTx('readwrite', (store) => store.add(record));
     }
 
     function deleteRecord(id) {
-      return new Promise((resolve, reject) => {
-        if (!db) return reject(new Error('本地数据库不可用'));
-        const req = db.transaction(STORE, 'readwrite').objectStore(STORE).delete(id);
-        req.onsuccess = () => resolve();
-        req.onerror = () => reject(req.error);
-      });
+      return runTx('readwrite', (store) => store.delete(id));
     }
 
     /* =========================================================
