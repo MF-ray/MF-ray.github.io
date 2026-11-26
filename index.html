@@ -484,13 +484,33 @@
 
       if (!records.length) { el.innerHTML = ''; return; }
 
+      // 先按天汇总收入/支出，用于每天分隔标题上的当日合计
+      const dayTotals = new Map();
+      records.forEach((r) => {
+        const d = new Date(r.createdAt);
+        const dayKey = d.getFullYear() + '-' + d.getMonth() + '-' + d.getDate();
+        let t = dayTotals.get(dayKey);
+        if (!t) { t = { income: 0, expense: 0 }; dayTotals.set(dayKey, t); }
+        if (r.type === 'income') t.income += r.amount;
+        else t.expense += r.amount;
+      });
+
       let html = '';
       let lastDay = '';
       records.forEach((r) => {
         const d = new Date(r.createdAt);
         const dayKey = d.getFullYear() + '-' + d.getMonth() + '-' + d.getDate();
         if (dayKey !== lastDay) {
-          html += '<div class="px-1 pb-1 pt-3 text-xs font-medium text-slate-400">' + fmtDateHeader(d) + '</div>';
+          const t = dayTotals.get(dayKey);
+          // 只显示当天实际发生的收入/支出项，避免标题过长
+          let sum = '';
+          if (t.income > 0) sum += '<span class="text-emerald-600">收 ¥' + t.income.toFixed(2) + '</span>';
+          if (t.expense > 0) sum += (sum ? '<span class="mx-1.5 text-slate-300">·</span>' : '') +
+                                     '<span class="text-slate-500">支 ¥' + t.expense.toFixed(2) + '</span>';
+          html += '<div class="flex items-baseline justify-between gap-2 px-1 pb-1 pt-3 text-xs">' +
+                    '<span class="font-medium text-slate-400">' + fmtDateHeader(d) + '</span>' +
+                    '<span class="shrink-0 tabular-nums">' + sum + '</span>' +
+                  '</div>';
           lastDay = dayKey;
         }
 
