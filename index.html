@@ -188,6 +188,21 @@
     </div>
   </div>
 
+  <!-- ==================== 改备注弹层 ==================== -->
+  <div id="noteLayer" class="fixed inset-0 z-50 hidden items-end justify-center bg-slate-900/30 p-4">
+    <div class="w-full max-w-md rounded-3xl bg-white p-5 shadow-xl">
+      <div class="text-base font-semibold">修改备注</div>
+      <div id="noteHint" class="mt-1 text-sm text-slate-400"></div>
+      <!-- 预填当前备注；留空保存即清空备注 -->
+      <input id="noteEditInput" type="text" maxlength="40" enterkeyhint="done" placeholder="写点什么…（留空即清空）"
+             class="mt-4 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm outline-none focus:border-indigo-500">
+      <div class="mt-5 flex gap-3">
+        <button id="noteEditCancel" type="button" class="press flex-1 rounded-2xl bg-slate-100 py-3 text-sm font-medium text-slate-600">取消</button>
+        <button id="noteEditSave" type="button" class="press flex-1 rounded-2xl bg-indigo-600 py-3 text-sm font-medium text-white">保存</button>
+      </div>
+    </div>
+  </div>
+
   <script>
   (function () {
     'use strict';
@@ -209,7 +224,7 @@
       amountRaw: '',                   // 金额原始字符串（支持小数点）
       records: [],                     // 全部记录（按时间倒序）
       pendingAction: null,             // 确认弹层的回调
-      editingId: null                  // 正在改分类的记录 id
+      editingId: null                  // 正在编辑（改分类/改备注）的记录 id
     };
 
     let db = null;                     // IndexedDB 实例
@@ -310,12 +325,12 @@
       return runTx('readwrite', (store) => store.delete(id));
     }
 
-    // 修改单条记录的分类：先 get 出原记录，只改 category 字段再 put 回去
+    // 修改单条记录的某个字段（category / note）：先 get 出原记录，只改目标字段再 put 回去
     // 同样带连接失效重连，和 runTx 保持一致
-    function updateCategory(id, category, retried) {
+    function updateField(id, field, value, retried) {
       return new Promise((resolve, reject) => {
         if (!db) {
-          openDB().then((fresh) => { db = fresh; return updateCategory(id, category, retried); })
+          openDB().then((fresh) => { db = fresh; return updateField(id, field, value, retried); })
                   .then(resolve, reject);
           return;
         }
@@ -324,7 +339,7 @@
           tx = db.transaction(STORE, 'readwrite');
         } catch (err) {
           if (!retried && isConnError(err)) {
-            reopenDB().then(() => updateCategory(id, category, true)).then(resolve, reject);
+            reopenDB().then(() => updateField(id, field, value, true)).then(resolve, reject);
           } else reject(err);
           return;
         }
@@ -333,13 +348,13 @@
         getReq.onsuccess = () => {
           const record = getReq.result;
           if (!record) { reject(new Error('记录不存在')); return; }
-          record.category = category;
+          record[field] = value;
           store.put(record);
         };
         tx.oncomplete = () => resolve();
         tx.onerror = () => {
           if (!retried && isConnError(tx.error)) {
-            reopenDB().then(() => updateCategory(id, category, true)).then(resolve, reject);
+            reopenDB().then(() => updateField(id, field, value, true)).then(resolve, reject);
           } else reject(tx.error || new Error('修改失败'));
         };
       });
@@ -499,6 +514,7 @@
               '<div class="text-sm font-semibold tabular-nums ' + amountColor + '">' + sign + '¥' + r.amount.toFixed(2) + '</div>' +
               '<div class="mt-1 flex items-center justify-end gap-3">' +
                 '<button type="button" data-edit="' + r.id + '" class="press text-[11px] text-indigo-500">改分类</button>' +
+                '<button type="button" data-note="' + r.id + '" class="press text-[11px] text-indigo-500">改备注</button>' +
                 '<button type="button" data-del="' + r.id + '" class="press text-[11px] text-slate-400">删除</button>' +
               '</div>' +
             '</div>' +
@@ -685,6 +701,37 @@
       state.editingId = null;
     }
 
+    // 打开「改备注」弹层：预填当前备注，留空保存即清空
+    function showNoteEditor(id) {
+      const rec = state.records.find((r) => r.id === id);
+      if (!rec) return toast('记录不存在');
+      state.editingId = id;
+      $('#noteHint').textContent =
+        (rec.type === 'income' ? '收入' : '支出') + ' ¥' + rec.amount.toFixed(2) + ' · ' + rec.category;
+      $('#noteEditInput').value = rec.note || '';
+      $('#noteLayer').style.display = 'flex';
+      // 弹层出现后自动聚焦并弹出键盘，减少一次点按
+      setTimeout(() => $('#noteEditInput').focus(), 50);
+    }
+    function hideNoteEditor() {
+      $('#noteLayer').style.display = 'none';
+      state.editingId = null;
+    }
+    // 保存备注：允许清空（空字符串）
+    async function saveNoteEdit() {
+      const id = state.editingId;
+      if (!id) return;
+      const note = $('#noteEditInput').value.trim();
+      hideNoteEditor();
+      try {
+        await updateField(id, 'note', note);
+        toast(note ? '备注已更新' : '已清空备注');
+        await refreshViews();
+      } catch (err) {
+        toast('修改失败：' + err.message);
+      }
+    }
+
     /* =========================================================
        6. PWA 图标与 manifest（运行时生成，保持只有一个文件）
        说明：Service Worker 必须是独立同源 JS 文件，单文件方案无法注册，
@@ -770,10 +817,13 @@
         btn.addEventListener('click', () => showTab(btn.dataset.tab));
       });
 
-      // 流水列表：改分类 / 删除（事件委托）
+      // 流水列表：改分类 / 改备注 / 删除（事件委托）
       $('#recordList').addEventListener('click', (e) => {
         const editBtn = e.target.closest('[data-edit]');
         if (editBtn) { showCategoryPicker(editBtn.dataset.edit); return; }
+
+        const noteBtn = e.target.closest('[data-note]');
+        if (noteBtn) { showNoteEditor(noteBtn.dataset.note); return; }
 
         const btn = e.target.closest('[data-del]');
         if (!btn) return;
@@ -795,7 +845,7 @@
         const id = state.editingId;
         const category = btn.dataset.pick;
         hideCategoryPicker();
-        updateCategory(id, category).then(async () => {
+        updateField(id, 'category', category).then(async () => {
           toast('已改为：' + category);
           await refreshViews();
         }).catch((err) => toast('修改失败：' + err.message));
@@ -804,6 +854,16 @@
       $('#categoryCancel').addEventListener('click', hideCategoryPicker);
       $('#categoryLayer').addEventListener('click', (e) => {
         if (e.target === $('#categoryLayer')) hideCategoryPicker();
+      });
+
+      // 改备注弹层
+      $('#noteEditSave').addEventListener('click', saveNoteEdit);
+      $('#noteEditCancel').addEventListener('click', hideNoteEditor);
+      $('#noteEditInput').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); saveNoteEdit(); }
+      });
+      $('#noteLayer').addEventListener('click', (e) => {
+        if (e.target === $('#noteLayer')) hideNoteEditor();
       });
 
       $('#confirmCancel').addEventListener('click', hideConfirm);
