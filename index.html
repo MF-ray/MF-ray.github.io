@@ -54,11 +54,20 @@
     <!-- ==================== 顶部栏 ==================== -->
     <header class="safe-top flex items-center justify-between border-b border-slate-200 bg-white px-5 py-3">
       <h1 class="text-lg font-semibold tracking-tight">极简记账</h1>
-      <button id="exportBtn" type="button"
-        class="press rounded-full border border-slate-200 bg-slate-50 px-3.5 py-1.5 text-xs font-medium text-slate-600">
-        导出 CSV
-      </button>
+      <div class="flex items-center gap-1.5">
+        <button id="importBtn" type="button"
+          class="press rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-600">
+          导入
+        </button>
+        <button id="exportBtn" type="button"
+          class="press rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-600">
+          导出
+        </button>
+      </div>
     </header>
+
+    <!-- 隐藏的文件选择器：导入 CSV 时用 -->
+    <input id="importFile" type="file" accept=".csv,text/csv" class="hidden">
 
     <!-- ==================== 三个页面（默认显示记账录入页） ==================== -->
     <main id="scroller" class="no-scrollbar relative flex-1 overflow-y-auto">
@@ -321,6 +330,34 @@
       return runTx('readwrite', (store) => store.add(record));
     }
 
+    // 批量写入（导入 CSV 用）：单个事务写完，同样带连接失效重连
+    function addRecords(records, retried) {
+      return new Promise((resolve, reject) => {
+        if (!db) {
+          openDB().then((fresh) => { db = fresh; return addRecords(records, retried); })
+                  .then(resolve, reject);
+          return;
+        }
+        let tx;
+        try {
+          tx = db.transaction(STORE, 'readwrite');
+        } catch (err) {
+          if (!retried && isConnError(err)) {
+            reopenDB().then(() => addRecords(records, true)).then(resolve, reject);
+          } else reject(err);
+          return;
+        }
+        const store = tx.objectStore(STORE);
+        records.forEach((r) => store.add(r));
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => {
+          if (!retried && isConnError(tx.error)) {
+            reopenDB().then(() => addRecords(records, true)).then(resolve, reject);
+          } else reject(tx.error || new Error('导入失败'));
+        };
+      });
+    }
+
     function deleteRecord(id) {
       return runTx('readwrite', (store) => store.delete(id));
     }
@@ -573,12 +610,14 @@
     function exportCSV() {
       if (!state.records.length) return toast('暂无记录可导出');
 
-      const rows = [['时间', '类型', '金额', '分类', '备注']];
+      // 第一列 id 用于导入时精确去重（旧版 CSV 无此列，也能按内容去重）
+      const rows = [['id', '时间', '类型', '金额', '分类', '备注']];
       state.records.forEach((r) => {
         const d = new Date(r.createdAt);
         const ts = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' +
                    pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
         rows.push([
+          r.id,
           ts,
           r.type === 'income' ? '收入' : '支出',
           (r.type === 'income' ? '' : '-') + r.amount.toFixed(2),
@@ -602,6 +641,108 @@
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
       toast('已导出全部记录');
+    }
+
+    /* =========================================================
+       4.2 导入 CSV（本地解析并合并，按 id / 内容签名去重）
+       兼容：新版带 id 列；旧版只有「时间/类型/金额/分类/备注」五列。
+       ========================================================= */
+
+    // 解析 CSV 文本为二维数组：正确处理双引号包裹、字段内逗号/换行/双引号转义
+    function parseCSV(text) {
+      if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1); // 去 BOM
+      const rows = [];
+      let row = [], cell = '', quoted = false;
+      for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (quoted) {
+          if (ch === '"') {
+            if (text[i + 1] === '"') { cell += '"'; i++; } // "" → 一个双引号
+            else quoted = false;
+          } else cell += ch;
+        } else {
+          if (ch === '"') quoted = true;
+          else if (ch === ',') { row.push(cell); cell = ''; }
+          else if (ch === '\n') {
+            if (cell.endsWith('\r')) cell = cell.slice(0, -1);
+            row.push(cell); rows.push(row); row = []; cell = '';
+          } else cell += ch;
+        }
+      }
+      if (cell.length || row.length) { row.push(cell); rows.push(row); }
+      return rows.filter((r) => r.some((c) => c !== '')); // 丢弃空行
+    }
+
+    // 记录内容签名：用于旧版无 id 的 CSV 去重（同时间/类型/金额/分类/备注视为同一笔）
+    function recordSignature(r) {
+      return [r.createdAt, r.type, r.amount.toFixed(2), r.category, r.note || ''].join('|');
+    }
+
+    async function importCSV(file) {
+      let text;
+      try {
+        text = await file.text();
+      } catch (err) {
+        return toast('读取文件失败：' + err.message);
+      }
+      const rows = parseCSV(text);
+      if (rows.length < 2) return toast('文件里没有可导入的记录');
+
+      // 按表头名定位列，容忍列顺序不同
+      const header = rows[0].map((h) => String(h).trim().replace(/^\uFEFF/, ''));
+      const col = (name) => header.indexOf(name);
+      const idxId = col('id'), idxTime = col('时间'), idxType = col('类型');
+      const idxAmount = col('金额'), idxCat = col('分类'), idxNote = col('备注');
+      if (idxTime < 0 || idxAmount < 0) return toast('CSV 缺少「时间」或「金额」列');
+
+      const existingIds = new Set(state.records.map((r) => r.id));
+      const existingSigs = new Set(state.records.map(recordSignature));
+      const toAdd = [];
+      let skipped = 0, invalid = 0;
+
+      for (let i = 1; i < rows.length; i++) {
+        const row = rows[i];
+        const timeStr = String(row[idxTime] || '').trim();
+        const createdAt = new Date(timeStr.replace(' ', 'T')).getTime();
+        const rawAmount = String(row[idxAmount] || '').trim();
+        const amount = Math.abs(parseFloat(rawAmount));
+        if (!timeStr || isNaN(createdAt) || isNaN(amount) || amount <= 0) { invalid++; continue; }
+
+        const typeRaw = String(idxType >= 0 ? row[idxType] : '').trim();
+        const type = /收入|income/i.test(typeRaw) ? 'income' : 'expense';
+        const catRaw = String(idxCat >= 0 ? row[idxCat] : '').trim();
+        const category = CATEGORIES[type].includes(catRaw) ? catRaw : '其他';
+        const note = String(idxNote >= 0 ? row[idxNote] : '').trim().slice(0, 40);
+
+        const record = {
+          id: (idxId >= 0 && String(row[idxId] || '').trim())
+                ? String(row[idxId]).trim()
+                : (window.crypto && crypto.randomUUID)
+                    ? crypto.randomUUID()
+                    : Date.now() + '-' + Math.random().toString(36).slice(2),
+          type: type,
+          amount: amount,
+          category: category,
+          note: note,
+          createdAt: createdAt
+        };
+        // 有 id 就按 id 判重；无 id 则按内容签名判重（含本批次内互相去重）
+        const sig = recordSignature(record);
+        if (existingIds.has(record.id) || existingSigs.has(sig)) { skipped++; continue; }
+        existingIds.add(record.id);
+        existingSigs.add(sig);
+        toAdd.push(record);
+      }
+
+      if (!toAdd.length) return toast(skipped ? ('全部重复，未导入 ' + skipped + ' 笔') : '没有可导入的有效记录');
+      try {
+        await addRecords(toAdd);
+        await refreshViews();
+        toast('已导入 ' + toAdd.length + ' 笔' + (skipped ? '，跳过重复 ' + skipped + ' 笔' : '') +
+              (invalid ? '，忽略无效 ' + invalid + ' 笔' : ''));
+      } catch (err) {
+        toast('导入失败：' + err.message);
+      }
     }
 
     /* =========================================================
@@ -831,6 +972,14 @@
 
       $('#saveBtn').addEventListener('click', saveRecord);
       $('#exportBtn').addEventListener('click', exportCSV);
+
+      // 导入 CSV：点按钮唤起文件选择，选中后本地解析合并
+      $('#importBtn').addEventListener('click', () => $('#importFile').click());
+      $('#importFile').addEventListener('change', (e) => {
+        const file = e.target.files && e.target.files[0];
+        if (file) importCSV(file);
+        e.target.value = ''; // 清空，允许重复选同一个文件
+      });
 
       // 底部导航
       document.querySelectorAll('.tab').forEach((btn) => {
