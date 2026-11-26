@@ -178,6 +178,16 @@
     </div>
   </div>
 
+  <!-- ==================== 改分类弹层 ==================== -->
+  <div id="categoryLayer" class="fixed inset-0 z-50 hidden items-end justify-center bg-slate-900/30 p-4">
+    <div class="w-full max-w-md rounded-3xl bg-white p-5 shadow-xl">
+      <div id="categoryTitle" class="text-base font-semibold">修改分类</div>
+      <div id="categoryHint" class="mt-1 text-sm text-slate-400"></div>
+      <div id="categoryOptions" class="mt-5 flex flex-wrap gap-2"></div>
+      <button id="categoryCancel" type="button" class="press mt-5 w-full rounded-2xl bg-slate-100 py-3 text-sm font-medium text-slate-600">取消</button>
+    </div>
+  </div>
+
   <script>
   (function () {
     'use strict';
@@ -198,7 +208,8 @@
       category: CATEGORIES.expense[0], // 当前分类
       amountRaw: '',                   // 金额原始字符串（支持小数点）
       records: [],                     // 全部记录（按时间倒序）
-      pendingAction: null              // 确认弹层的回调
+      pendingAction: null,             // 确认弹层的回调
+      editingId: null                  // 正在改分类的记录 id
     };
 
     let db = null;                     // IndexedDB 实例
@@ -297,6 +308,41 @@
 
     function deleteRecord(id) {
       return runTx('readwrite', (store) => store.delete(id));
+    }
+
+    // 修改单条记录的分类：先 get 出原记录，只改 category 字段再 put 回去
+    // 同样带连接失效重连，和 runTx 保持一致
+    function updateCategory(id, category, retried) {
+      return new Promise((resolve, reject) => {
+        if (!db) {
+          openDB().then((fresh) => { db = fresh; return updateCategory(id, category, retried); })
+                  .then(resolve, reject);
+          return;
+        }
+        let tx;
+        try {
+          tx = db.transaction(STORE, 'readwrite');
+        } catch (err) {
+          if (!retried && isConnError(err)) {
+            reopenDB().then(() => updateCategory(id, category, true)).then(resolve, reject);
+          } else reject(err);
+          return;
+        }
+        const store = tx.objectStore(STORE);
+        const getReq = store.get(id);
+        getReq.onsuccess = () => {
+          const record = getReq.result;
+          if (!record) { reject(new Error('记录不存在')); return; }
+          record.category = category;
+          store.put(record);
+        };
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => {
+          if (!retried && isConnError(tx.error)) {
+            reopenDB().then(() => updateCategory(id, category, true)).then(resolve, reject);
+          } else reject(tx.error || new Error('修改失败'));
+        };
+      });
     }
 
     /* =========================================================
@@ -451,7 +497,10 @@
             '</div>' +
             '<div class="shrink-0 text-right">' +
               '<div class="text-sm font-semibold tabular-nums ' + amountColor + '">' + sign + '¥' + r.amount.toFixed(2) + '</div>' +
-              '<button type="button" data-del="' + r.id + '" class="press mt-1 text-[11px] text-slate-400">删除</button>' +
+              '<div class="mt-1 flex items-center justify-end gap-3">' +
+                '<button type="button" data-edit="' + r.id + '" class="press text-[11px] text-indigo-500">改分类</button>' +
+                '<button type="button" data-del="' + r.id + '" class="press text-[11px] text-slate-400">删除</button>' +
+              '</div>' +
             '</div>' +
           '</div>';
       });
@@ -615,6 +664,27 @@
       state.pendingAction = null;
     }
 
+    // 打开「改分类」弹层：按该记录的收支类型显示对应分类
+    function showCategoryPicker(id) {
+      const rec = state.records.find((r) => r.id === id);
+      if (!rec) return toast('记录不存在');
+      state.editingId = id;
+      const isIncome = rec.type === 'income';
+      $('#categoryHint').textContent =
+        (isIncome ? '收入' : '支出') + ' ¥' + rec.amount.toFixed(2) + ' · 当前：' + rec.category;
+      $('#categoryOptions').innerHTML = CATEGORIES[rec.type].map((cat) => {
+        const active = cat === rec.category;
+        return '<button type="button" data-pick="' + cat + '" class="press rounded-full border px-4 py-2 text-sm font-medium ' +
+          (active ? 'border-indigo-600 bg-indigo-600 text-white' : 'border-slate-200 bg-white text-slate-600') +
+          '">' + cat + '</button>';
+      }).join('');
+      $('#categoryLayer').style.display = 'flex';
+    }
+    function hideCategoryPicker() {
+      $('#categoryLayer').style.display = 'none';
+      state.editingId = null;
+    }
+
     /* =========================================================
        6. PWA 图标与 manifest（运行时生成，保持只有一个文件）
        说明：Service Worker 必须是独立同源 JS 文件，单文件方案无法注册，
@@ -700,8 +770,11 @@
         btn.addEventListener('click', () => showTab(btn.dataset.tab));
       });
 
-      // 删除（事件委托）
+      // 流水列表：改分类 / 删除（事件委托）
       $('#recordList').addEventListener('click', (e) => {
+        const editBtn = e.target.closest('[data-edit]');
+        if (editBtn) { showCategoryPicker(editBtn.dataset.edit); return; }
+
         const btn = e.target.closest('[data-del]');
         if (!btn) return;
         showConfirm('删除这条记录？', '删除后无法恢复', async () => {
@@ -713,6 +786,24 @@
             toast('删除失败：' + err.message);
           }
         });
+      });
+
+      // 改分类弹层：点某个分类即保存
+      $('#categoryOptions').addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-pick]');
+        if (!btn || !state.editingId) return;
+        const id = state.editingId;
+        const category = btn.dataset.pick;
+        hideCategoryPicker();
+        updateCategory(id, category).then(async () => {
+          toast('已改为：' + category);
+          await refreshViews();
+        }).catch((err) => toast('修改失败：' + err.message));
+      });
+
+      $('#categoryCancel').addEventListener('click', hideCategoryPicker);
+      $('#categoryLayer').addEventListener('click', (e) => {
+        if (e.target === $('#categoryLayer')) hideCategoryPicker();
       });
 
       $('#confirmCancel').addEventListener('click', hideConfirm);
